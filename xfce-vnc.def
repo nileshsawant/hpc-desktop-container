@@ -1,0 +1,114 @@
+# XFCE desktop + TigerVNC + noVNC + VirtualGL for Gila Grace Hopper (arm64)
+#
+# Build (on a gh compute node, from this directory):
+#   export APPTAINER_CACHEDIR=/scratch/$USER/apptainer-cache APPTAINER_TMPDIR=$TMPDIR
+#   apptainer build --fakeroot xfce-vnc.sif xfce-vnc.def
+# If ports.ubuntu.com is flaky, use another arm64 mirror:
+#   apptainer build --fakeroot --build-arg UBUNTU_MIRROR=http://mirrors.ocf.berkeley.edu/ubuntu-ports xfce-vnc.sif xfce-vnc.def
+#
+# Run: see xfce-desktop.sbatch
+
+Bootstrap: docker
+# AWS ECR Public mirror of the Docker Hub official image (Docker Hub rate-limits Gila's shared IP)
+From: public.ecr.aws/docker/library/ubuntu:26.04
+
+%arguments
+    UBUNTU_MIRROR=http://ports.ubuntu.com/ubuntu-ports
+
+%labels
+    Description XFCE desktop with TigerVNC, noVNC and VirtualGL (Gila Grace Hopper, arm64)
+    Maintainer NLR HPC Apps
+
+%files
+    start-desktop /opt/desktop/bin/start-desktop
+    bwrap-wrapper /usr/local/bin/bwrap
+
+%post
+    set -eu
+    export DEBIAN_FRONTEND=noninteractive
+    # apt's privilege-dropping sandbox does not work under fakeroot
+    echo 'APT::Sandbox::User "root";' > /etc/apt/apt.conf.d/99-sandbox
+    # Some ports.ubuntu.com mirror IPs hang; time out and retry instead of stalling
+    printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' \
+        > /etc/apt/apt.conf.d/99-retries
+    sed -i 's|http://ports.ubuntu.com/ubuntu-ports|{{ UBUNTU_MIRROR }}|g' /etc/apt/sources.list.d/ubuntu.sources
+
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg locales tzdata \
+        dbus dbus-x11 at-spi2-core xdg-utils \
+        xfce4 xfce4-terminal xfce4-taskmanager xfce4-notifyd thunar mousepad ristretto \
+        adwaita-icon-theme elementary-xfce-icon-theme \
+        fonts-dejavu fonts-liberation xfonts-base \
+        tigervnc-standalone-server tigervnc-tools novnc python3-websockify \
+        x11-xserver-utils x11-utils xauth \
+        mesa-utils libegl1 libgl1 libglu1-mesa libxv1 libxtst6 \
+        less nano vim-tiny htop procps psmisc \
+        openssh-client rsync gvfs-backends \
+        python3-pip python3-venv python3-dev build-essential git wget unzip
+
+    # The image is read-only, so pip can only ever install to the user site or a venv;
+    # drop the PEP 668 marker so `pip install --user` works without extra flags.
+    rm -f /usr/lib/python3*/EXTERNALLY-MANAGED
+
+    # Screen lockers prompt for a password that does not exist inside the container
+    apt-get purge -y xfce4-screensaver light-locker xfce4-power-manager 2>/dev/null || true
+
+    # VirtualGL (official repo, provides arm64)
+    curl -fsSL https://packagecloud.io/dcommander/virtualgl/gpgkey \
+        | gpg --dearmor -o /etc/apt/trusted.gpg.d/VirtualGL.gpg
+    curl -fsSL -o /etc/apt/sources.list.d/VirtualGL.list \
+        https://raw.githubusercontent.com/VirtualGL/repo/main/VirtualGL.list
+
+    # Firefox from Mozilla's APT repo (Ubuntu's firefox package is a snap wrapper)
+    install -d -m 0755 /etc/apt/keyrings
+    curl -fsSL -o /etc/apt/keyrings/packages.mozilla.org.asc \
+        https://packages.mozilla.org/apt/repo-signing-key.gpg
+    echo "deb [signed-by=/etc/apt/keyrings/packages.mozilla.org.asc] https://packages.mozilla.org/apt mozilla main" \
+        > /etc/apt/sources.list.d/mozilla.list
+    printf 'Package: *\nPin: origin packages.mozilla.org\nPin-Priority: 1000\n' \
+        > /etc/apt/preferences.d/mozilla
+
+    apt-get update
+    apt-get install -y --no-install-recommends virtualgl firefox
+
+    # pixi: users install conda-forge packages without root, usable immediately
+    # (pixi global install <pkg>); environments live in $PIXI_HOME
+    curl -fsSL "https://github.com/prefix-dev/pixi/releases/latest/download/pixi-$(uname -m)-unknown-linux-musl.tar.gz" \
+        | tar -xz -C /usr/local/bin pixi
+    chmod 0755 /usr/local/bin/pixi
+
+    # Let glvnd find the NVIDIA EGL driver that `apptainer --nv` binds in
+    mkdir -p /usr/share/glvnd/egl_vendor.d
+    printf '{"file_format_version":"1.0.0","ICD":{"library_path":"libEGL_nvidia.so.0"}}\n' \
+        > /usr/share/glvnd/egl_vendor.d/10_nvidia.json
+
+    chmod 0755 /opt/desktop/bin/start-desktop /usr/local/bin/bwrap
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
+    # apt chowns its partial/ download dir to _apt; in a root-mapped fakeroot namespace that
+    # dir cannot be copied up into an overlay, breaking user installs (xfce-vnc-install).
+    # Remove it so apt recreates it, root-owned, inside the overlay.
+    rm -rf /var/cache/apt/archives/partial
+
+%environment
+    export LANG=C.UTF-8 LC_ALL=C.UTF-8
+    export PATH=/opt/desktop/bin:/opt/VirtualGL/bin:$PATH
+    # VirtualGL: render on the GPU through EGL (no host X server needed)
+    export VGL_DISPLAY=${VGL_DISPLAY:-egl}
+    # Keep container pip --user installs apart from the host Python's ~/.local
+    export PYTHONUSERBASE=${PYTHONUSERBASE:-$HOME/.local/xfce-vnc}
+    export PATH=$PYTHONUSERBASE/bin:$PATH
+    export PIXI_HOME=${PIXI_HOME:-$HOME/.local/xfce-vnc/pixi}
+    export PATH=$PIXI_HOME/bin:$PATH
+
+%runscript
+    exec /opt/desktop/bin/start-desktop "$@"
+
+%test
+    for c in Xvnc vncpasswd startxfce4 websockify vglrun firefox xfce4-terminal thunar mousepad pip3 gcc git pixi ssh rsync; do
+        command -v "$c" >/dev/null || PATH=/opt/VirtualGL/bin:$PATH command -v "$c" >/dev/null \
+            || { echo "missing: $c"; exit 1; }
+    done
+    test -f /usr/share/novnc/vnc.html
+    test -x /usr/libexec/gvfsd-sftp

@@ -1,0 +1,141 @@
+#!/bin/bash
+# Start an XFCE desktop inside TigerVNC (and optionally noVNC) for the current user.
+# VNC and noVNC listen on 127.0.0.1 only; users reach them through an SSH tunnel.
+#
+# Environment:
+#   DESKTOP_GEOMETRY    initial resolution            (default 1920x1080)
+#   DESKTOP_NOVNC       1 = start noVNC web access     (default 1)
+#   DESKTOP_LOGIN_HOST  login node shown in tunnel cmd (default gila-arm.hpc.nlr.gov on
+#                       aarch64, gila.hpc.nlr.gov on x86_64)
+#   DESKTOP_SESSION_DIR per-user session directory     (default $HOME/.xfce-vnc)
+set -euo pipefail
+umask 077
+
+GEOMETRY=${DESKTOP_GEOMETRY:-1920x1080}
+NOVNC=${DESKTOP_NOVNC:-1}
+if [[ $(uname -m) == aarch64 ]]; then
+    LOGIN_HOST=${DESKTOP_LOGIN_HOST:-gila-arm.hpc.nlr.gov}
+else
+    LOGIN_HOST=${DESKTOP_LOGIN_HOST:-gila.hpc.nlr.gov}
+fi
+SESSION_ROOT=${DESKTOP_SESSION_DIR:-$HOME/.xfce-vnc}
+SESSION_ID=${SLURM_JOB_ID:-$$}
+SESSION_DIR=$SESSION_ROOT/$SESSION_ID
+NODE=$(hostname -s)
+
+mkdir -p "$SESSION_DIR"
+chmod 700 "$SESSION_ROOT" "$SESSION_DIR"
+
+export XDG_RUNTIME_DIR
+XDG_RUNTIME_DIR=$(mktemp -d "/tmp/xfce-vnc-$USER.XXXXXX")
+export XAUTHORITY=$SESSION_DIR/Xauthority
+
+PIDS=()
+cleanup() {
+    # Slurm and Apptainer may deliver SIGTERM more than once; finish cleanup regardless
+    trap - EXIT
+    trap '' INT TERM
+    rm -f "$SESSION_DIR/passwd" "$XAUTHORITY"
+    for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null || true; done
+    sleep 1
+    for p in "${PIDS[@]}"; do kill -9 "$p" 2>/dev/null || true; done
+    rm -rf "$XDG_RUNTIME_DIR"
+    [[ -f $SESSION_DIR/connection.txt ]] && echo "Session ended: $(date)" >> "$SESSION_DIR/connection.txt"
+}
+trap cleanup EXIT INT TERM
+
+port_in_use() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+random_string() { python3 -c "import secrets,string; print(''.join(secrets.choice(string.ascii_letters+string.digits) for _ in range($1)))"; }
+
+# VNC authentication only uses the first 8 characters
+VNC_PASSWORD=$(random_string 8)
+vncpasswd -f <<<"$VNC_PASSWORD" > "$SESSION_DIR/passwd"
+
+# Find a free display; Xvnc's lock file arbitrates races with other users on the node
+DISPLAY_NUM=""
+for d in $(seq 1 99); do
+    [[ -e /tmp/.X${d}-lock || -e /tmp/.X11-unix/X${d} ]] && continue
+    port_in_use $((5900 + d)) && continue
+
+    rm -f "$XAUTHORITY"
+    touch "$XAUTHORITY"
+    xauth -q -f "$XAUTHORITY" add ":$d" MIT-MAGIC-COOKIE-1 "$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+
+    Xvnc ":$d" \
+        -rfbport $((5900 + d)) -localhost \
+        -SecurityTypes VncAuth -rfbauth "$SESSION_DIR/passwd" \
+        -auth "$XAUTHORITY" -nolisten tcp \
+        -geometry "$GEOMETRY" -depth 24 \
+        -desktop "Gila XFCE ($NODE)" -AlwaysShared \
+        > "$SESSION_DIR/Xvnc.log" 2>&1 &
+    XVNC_PID=$!
+
+    for _ in $(seq 1 50); do
+        kill -0 "$XVNC_PID" 2>/dev/null || break
+        [[ -S /tmp/.X11-unix/X${d} ]] && { DISPLAY_NUM=$d; break; }
+        sleep 0.2
+    done
+    [[ -n $DISPLAY_NUM ]] && break
+    kill "$XVNC_PID" 2>/dev/null || true
+done
+
+if [[ -z $DISPLAY_NUM ]]; then
+    echo "ERROR: could not start Xvnc; see $SESSION_DIR/Xvnc.log" >&2
+    exit 1
+fi
+PIDS+=("$XVNC_PID")
+export DISPLAY=:$DISPLAY_NUM
+VNC_PORT=$((5900 + DISPLAY_NUM))
+
+# XFCE session with its own D-Bus session bus
+unset SESSION_MANAGER DBUS_SESSION_BUS_ADDRESS
+dbus-run-session -- startxfce4 > "$SESSION_DIR/xfce.log" 2>&1 &
+XFCE_PID=$!
+PIDS+=("$XFCE_PID")
+
+WEB_PORT=""
+if [[ $NOVNC == 1 ]]; then
+    for p in $(seq $((6080 + DISPLAY_NUM)) 6199); do
+        port_in_use "$p" && continue
+        websockify --web /usr/share/novnc "127.0.0.1:$p" "127.0.0.1:$VNC_PORT" \
+            > "$SESSION_DIR/novnc.log" 2>&1 &
+        WS_PID=$!
+        sleep 1
+        if kill -0 "$WS_PID" 2>/dev/null; then
+            WEB_PORT=$p
+            PIDS+=("$WS_PID")
+            break
+        fi
+    done
+fi
+
+{
+    echo "Gila XFCE desktop - started $(date)"
+    echo "Node:          $NODE"
+    echo "Display:       $DISPLAY"
+    echo "VNC password:  $VNC_PASSWORD"
+    echo
+    echo "== Option 1: VNC client (TigerVNC / TurboVNC / RealVNC viewer) =="
+    echo "  On your desktop run:"
+    echo "    ssh -N -L $VNC_PORT:localhost:$VNC_PORT -J $USER@$LOGIN_HOST $USER@$NODE"
+    echo "  Then connect your viewer to:  localhost:$VNC_PORT"
+    if [[ -n $WEB_PORT ]]; then
+        echo
+        echo "== Option 2: Web browser (noVNC) =="
+        echo "  On your desktop run:"
+        echo "    ssh -N -L $WEB_PORT:localhost:$WEB_PORT -J $USER@$LOGIN_HOST $USER@$NODE"
+        echo "  Then open:  http://localhost:$WEB_PORT/vnc.html?autoconnect=1&resize=remote"
+        echo "  Copy/paste: use the Clipboard box in noVNC's left-side panel to move text"
+        echo "  between the desktop and your computer (a VNC client syncs the clipboard directly)."
+    fi
+    echo
+    echo "GPU-accelerated OpenGL apps: run them with  vglrun <app>"
+    echo "To end the session: log out of XFCE, or  scancel ${SLURM_JOB_ID:-<jobid>}"
+} > "$SESSION_DIR/connection.txt"
+chmod 600 "$SESSION_DIR/connection.txt"
+
+echo "Desktop running on $NODE (display $DISPLAY)."
+echo "Connection details and password:  cat $SESSION_DIR/connection.txt"
+
+# End when XFCE logs out or Xvnc dies
+wait -n "$XFCE_PID" "$XVNC_PID" || true

@@ -1,0 +1,65 @@
+#!/bin/bash
+# Install extra software into a personal, persistent overlay for the xfce-vnc desktop.
+# Run on a login or compute node of the same architecture as the desktop (not inside
+# the desktop), from the same directory you submit the desktop job from. Restart the
+# desktop job afterwards to pick up changes.
+set -euo pipefail
+
+HERE=$(dirname "$(readlink -f "$0")")
+SIF=${DESKTOP_SIF:-$HERE/../xfce-vnc.sif}
+BASE=${DESKTOP_DATA:-$PWD/xfce-vnc-data}
+DATA=$BASE/$(uname -m)
+# Move data from the original single-architecture layout (Grace Hopper only)
+if [[ $(uname -m) == aarch64 && ! -e $DATA ]]; then
+    for d in local cache overlay; do
+        if [[ -e $BASE/$d ]]; then
+            mkdir -p "$DATA" && mv "$BASE/$d" "$DATA/" && echo "Moved $BASE/$d -> $DATA/$d"
+        fi
+    done
+fi
+OVERLAY=${DESKTOP_OVERLAY:-$DATA/overlay}
+
+usage() {
+    cat <<EOF
+Usage:
+  ${0##*/} apt <package> [package...]   apt-get install packages into your overlay
+  ${0##*/} shell                        root (fakeroot) shell with your overlay writable
+  ${0##*/} reset                        delete your overlay
+
+Overlay: $OVERLAY
+  Defaults to xfce-vnc-data/$(uname -m)/overlay in the current directory; run this from the directory
+  you submit the desktop job from (or set DESKTOP_DATA / DESKTOP_OVERLAY).
+For most software no overlay or restart is needed; inside the desktop use
+  pixi global install <pkg>     (conda-forge packages, e.g. paraview, gnuplot, ffmpeg)
+  pip install --user <pkg>      (or python3 -m venv)
+EOF
+    exit 1
+}
+
+[[ $# -ge 1 ]] || usage
+cmd=$1; shift
+
+run() {
+    mkdir -p "$OVERLAY"
+    apptainer exec --fakeroot --overlay "$OVERLAY" "$SIF" "$@"
+}
+
+case $cmd in
+    apt)
+        [[ $# -ge 1 ]] || usage
+        run bash -c 'export DEBIAN_FRONTEND=noninteractive
+            apt-get update && apt-get install -y --no-install-recommends "$@"; rc=$?
+            apt-get clean; rm -rf /var/lib/apt/lists/*; exit $rc' bash "$@"
+        ;;
+    shell)
+        run bash
+        ;;
+    reset)
+        [[ -d $OVERLAY ]] || { echo "No overlay at $OVERLAY"; exit 0; }
+        read -rp "Delete $OVERLAY and everything installed in it? [y/N] " a
+        [[ $a == [yY] ]] && rm -rf -- "$OVERLAY" && echo "Removed."
+        ;;
+    *)
+        usage
+        ;;
+esac

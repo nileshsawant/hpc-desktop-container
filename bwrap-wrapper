@@ -1,0 +1,12 @@
+#!/bin/sh
+# bubblewrap wrapper for running inside Apptainer.
+# On some host kernels bwrap cannot bind-mount the container's root filesystem (EINVAL).
+# glycin (GTK/XFCE image loading) then fails every image load and XFCE components crash.
+# If bwrap does not work here, report it the way glycin recognises so it falls back to
+# loading images without its sandbox; otherwise run the real bwrap.
+if /usr/bin/bwrap --ro-bind /usr /usr --symlink usr/lib /lib --symlink usr/lib64 /lib64 \
+        /usr/bin/true >/dev/null 2>&1; then
+    exec /usr/bin/bwrap "$@"
+fi
+echo "bwrap: Creating new namespace failed: bind mounts not supported in this container" >&2
+exit 159
