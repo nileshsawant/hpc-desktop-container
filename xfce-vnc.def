@@ -1,12 +1,9 @@
-# XFCE desktop + TigerVNC + noVNC + VirtualGL for Gila Grace Hopper (arm64)
+# XFCE desktop + TigerVNC + noVNC + VirtualGL for Gila GPU nodes (Grace Hopper arm64 and A100 x86_64)
 #
-# Build (on a gh compute node, from this directory):
-#   export APPTAINER_CACHEDIR=/scratch/$USER/apptainer-cache APPTAINER_TMPDIR=$TMPDIR
-#   apptainer build --fakeroot xfce-vnc.sif xfce-vnc.def
-# If ports.ubuntu.com is flaky, use another arm64 mirror:
-#   apptainer build --fakeroot --build-arg UBUNTU_MIRROR=http://mirrors.ocf.berkeley.edu/ubuntu-ports xfce-vnc.sif xfce-vnc.def
+# Build with ./build.sh on a compute node of the target architecture; the image matches the node.
+# UBUNTU_MIRROR only applies to arm64 (x86_64 images use archive.ubuntu.com).
 #
-# Run: see xfce-desktop.sbatch
+# Run: see xfce-desktop.sbatch (Grace Hopper) or xfce-desktop-a100.sbatch (A100)
 
 Bootstrap: docker
 # AWS ECR Public mirror of the Docker Hub official image (Docker Hub rate-limits Gila's shared IP)
@@ -16,7 +13,7 @@ From: public.ecr.aws/docker/library/ubuntu:26.04
     UBUNTU_MIRROR=http://ports.ubuntu.com/ubuntu-ports
 
 %labels
-    Description XFCE desktop with TigerVNC, noVNC and VirtualGL (Gila Grace Hopper, arm64)
+    Description XFCE desktop with TigerVNC, noVNC and VirtualGL (Gila GPU nodes)
     Maintainer NLR HPC Apps
 
 %files
